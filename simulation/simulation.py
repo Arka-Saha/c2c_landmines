@@ -5,6 +5,13 @@ import math
 import os
 import numpy as np
 import cv2
+import matplotlib.pyplot as plt
+
+try:
+    import winsound
+    HAS_WINSOUND = True
+except ImportError:
+    HAS_WINSOUND = False
 
 # ============================================================
 # SETUP
@@ -16,17 +23,35 @@ p.setGravity(0, 0, -9.8)
 
 plane = p.loadURDF("plane.urdf")
 
-START_POINT = [0, 0, 0.5]
-END_POINT = [10, 0, 0.5]
+# Tint the ground a sandy/dirt tone instead of the default blue-and-white
+# checkerboard, to look more like actual battlefield/minefield terrain.
+p.changeVisualShape(plane, -1, rgbaColor=[0.76, 0.68, 0.48, 1.0])
 
-robot = p.loadURDF("quadruped/quadruped.urdf", START_POINT)
+START_X = 0
+END_X = 10
+
+# Three robots on parallel paths, 2 units apart perpendicular to the
+# direction of travel (left robot at y=-2, center at y=0, right at y=+2)
+ROBOT_Y_OFFSETS = {"left": -2.0, "center": 0.0, "right": 2.0}
 
 p.resetDebugVisualizerCamera(
-    cameraDistance=9.0,
+    cameraDistance=11.0,
     cameraYaw=50,
-    cameraPitch=-40,
-    cameraTargetPosition=[(START_POINT[0] + END_POINT[0]) / 2, 0, 0],
+    cameraPitch=-45,
+    cameraTargetPosition=[(START_X + END_X) / 2, 0, 0],
 )
+
+# --- Night mode: press 'N' during the simulation to toggle ---
+NIGHT_MODE = False
+DAY_GROUND = [0.76, 0.68, 0.48, 1.0]
+NIGHT_GROUND = [0.12, 0.12, 0.16, 1.0]
+
+
+def apply_night_mode(is_night):
+    p.changeVisualShape(plane, -1, rgbaColor=NIGHT_GROUND if is_night else DAY_GROUND)
+
+
+apply_night_mode(NIGHT_MODE)
 
 MOTORS = {
     "front_rightR": 0,
@@ -39,17 +64,6 @@ MOTORS = {
     "back_leftL": 21,
 }
 
-# --- Gait tuning constants ---
-AMPLITUDE = 0.2
-FREQUENCY = 1.5
-RL_PHASE_OFFSET = math.pi / 4
-BASE_ANGLE = 0.0
-
-NORMAL_SPEED = 0.6      # meters per second (bumped up from 0.4)
-BOOST_SPEED = 1.3       # meters per second, used right after a detection
-BOOST_DURATION = 2.0    # seconds to stay at boosted speed after resuming
-STOP_DURATION = 4.0     # seconds to stop and "report" on detection
-
 DIAGONAL_PHASE = {
     "front_right": 0.0,
     "back_left": 0.0,
@@ -57,22 +71,72 @@ DIAGONAL_PHASE = {
     "back_right": math.pi,
 }
 
+# --- Gait tuning constants ---
+AMPLITUDE = 0.2
+FREQUENCY = 1.5
+RL_PHASE_OFFSET = math.pi / 4
+BASE_ANGLE = 0.0
+
+NORMAL_SPEED = 1.4
+BOOST_SPEED = 1.3
+BOOST_DURATION = 2.0
+STOP_DURATION = 4.0
+DETECTION_RANGE = 0.8
+
+# --- Obstacle avoidance tuning ---
+AVOID_LOOKAHEAD = 1.2      # start steering around an obstacle this far before reaching it
+AVOID_CLEAR_MARGIN = 1.0   # keep steering until this far past the obstacle
+OBSTACLE_LANE_THRESHOLD = 0.6  # how close (in y) an obstacle must be to a robot's lane to matter
+AVOID_OFFSET = 0.5         # how far sideways a robot shifts to go around an obstacle
+LATERAL_KP = 1.5           # proportional gain: how eagerly it steers toward its target y
+MAX_LATERAL_SPEED = 0.6    # cap on sideways speed (keeps it a gentle divert, not a swerve)
+
 # ============================================================
-# PLACE THREE LANDMINE OBJECTS ALONG THE ROBOT'S PATH
-# Visual-only (no collision shape) so the robot never physically
-# hits them — detection is purely camera-based, no flipping.
+# LOAD THE SWARM
+# ============================================================
+
+robots = {}
+for name, y_offset in ROBOT_Y_OFFSETS.items():
+    body_id = p.loadURDF("quadruped/quadruped.urdf", [START_X, y_offset, 0.5])
+    robots[name] = {
+        "body_id": body_id,
+        "y_offset": y_offset,
+        "state": "MOVING",       # MOVING | STOPPED
+        "stop_end_time": 0.0,
+        "boost_end_time": 0.0,
+        "reached_destination": False,
+    }
+
+# ============================================================
+# MINEFIELD: original 3 near the center path + 6 more scattered
+# near the left/right paths so each robot can encounter its own.
+# Visual-only (no collision) so robots never physically hit them.
 # ============================================================
 
 IMG_FOLDER = r"C:\Users\ddhan\OneDrive\Documents\c2c hackathon\img data"
 image_files = sorted(os.listdir(IMG_FOLDER))
 
+
+def cycle_image(i):
+    return image_files[i % len(image_files)]
+
+
 MINE_LAYOUT = [
-    {"image": image_files[0 % len(image_files)], "position": [2.5, 0.0, 0.03]},
-    {"image": image_files[1 % len(image_files)], "position": [5.5, 0.4, 0.03]},
-    {"image": image_files[2 % len(image_files)], "position": [8.0, -0.3, 0.03]},
+    # near the center path (y ~ 0)
+    {"id": "mine_c1", "image": cycle_image(0), "position": [2.5, 0.0, 0.03]},
+    {"id": "mine_c2", "image": cycle_image(1), "position": [5.5, 0.4, 0.03]},
+    {"id": "mine_c3", "image": cycle_image(2), "position": [8.0, -0.3, 0.03]},
+    # near the left path (y ~ -2)
+    {"id": "mine_l1", "image": cycle_image(0), "position": [2.0, -1.7, 0.03]},
+    {"id": "mine_l2", "image": cycle_image(1), "position": [5.0, -2.3, 0.03]},
+    {"id": "mine_l3", "image": cycle_image(2), "position": [8.5, -1.9, 0.03]},
+    # near the right path (y ~ +2)
+    {"id": "mine_r1", "image": cycle_image(0), "position": [3.5, 2.2, 0.03]},
+    {"id": "mine_r2", "image": cycle_image(1), "position": [6.0, 1.8, 0.03]},
+    {"id": "mine_r3", "image": cycle_image(2), "position": [9.0, 2.3, 0.03]},
 ]
 
-mine_filename_to_position = {}
+mine_position_lookup = {}
 
 for mine in MINE_LAYOUT:
     texture_path = os.path.join(IMG_FOLDER, mine["image"])
@@ -87,34 +151,63 @@ for mine in MINE_LAYOUT:
     )
     texture_id = p.loadTexture(texture_path)
     p.changeVisualShape(mine_body, -1, textureUniqueId=texture_id)
-    mine_filename_to_position[mine["image"]] = mine["position"]
+    mine_position_lookup[mine["id"]] = mine["position"]
 
-# --- Decoy mine, well off the robot's path ---
-# Placed far enough from the route that it will NEVER come within
-# DETECTION_RANGE, demonstrating that detection is genuinely tied to the
-# robot's actual path rather than firing on anything in the scene. It's
-# intentionally NOT added to MINE_LAYOUT, so it never enters the detection
-# candidate list at all — positioned to still be visible in the debug
-# camera's framing.
-DECOY_MINE_IMAGE = image_files[0 % len(image_files)]
-DECOY_MINE_POSITION = [4.5, 3.0, 0.03]
-
-decoy_texture_path = os.path.join(IMG_FOLDER, DECOY_MINE_IMAGE)
+# --- Decoy mine, well off every robot's path (all paths sit within y = -2..+2) ---
+DECOY_IMAGE = cycle_image(0)
+DECOY_POSITION = [4.5, 4.8, 0.03]
+decoy_texture_path = os.path.join(IMG_FOLDER, DECOY_IMAGE)
 decoy_visual = p.createVisualShape(
     shapeType=p.GEOM_CYLINDER, radius=0.15, length=0.05, rgbaColor=[1, 1, 1, 1]
 )
 decoy_body = p.createMultiBody(
-    baseMass=0,
-    baseCollisionShapeIndex=-1,
-    baseVisualShapeIndex=decoy_visual,
-    basePosition=DECOY_MINE_POSITION,
+    baseMass=0, baseCollisionShapeIndex=-1, baseVisualShapeIndex=decoy_visual, basePosition=DECOY_POSITION
 )
 decoy_texture_id = p.loadTexture(decoy_texture_path)
 p.changeVisualShape(decoy_body, -1, textureUniqueId=decoy_texture_id)
 
 # ============================================================
-# REAL DETECTION: OpenCV ORB feature matching against your
-# reference landmine photos (no training needed)
+# OBSTACLES: trees and stones placed directly in each robot's
+# path. Visual-only (no collision) — avoidance is handled by
+# scripted lateral steering below, the same safe approach used
+# for the mines, so nothing can cause a physics-flip on contact.
+# ============================================================
+
+OBSTACLES = [
+    {"type": "tree", "position": [3.0, 0.05, 0]},    # center lane
+    {"type": "stone", "position": [7.0, -0.1, 0]},   # center lane
+    {"type": "stone", "position": [4.5, -2.1, 0]},   # left lane
+    {"type": "tree", "position": [7.5, 2.1, 0]},      # right lane
+]
+
+for obs in OBSTACLES:
+    ox, oy, oz = obs["position"]
+    if obs["type"] == "tree":
+        trunk_visual = p.createVisualShape(
+            shapeType=p.GEOM_CYLINDER, radius=0.08, length=0.6, rgbaColor=[0.45, 0.28, 0.1, 1.0]
+        )
+        p.createMultiBody(
+            baseMass=0, baseCollisionShapeIndex=-1, baseVisualShapeIndex=trunk_visual,
+            basePosition=[ox, oy, 0.3],
+        )
+        canopy_visual = p.createVisualShape(
+            shapeType=p.GEOM_SPHERE, radius=0.35, rgbaColor=[0.13, 0.5, 0.13, 1.0]
+        )
+        p.createMultiBody(
+            baseMass=0, baseCollisionShapeIndex=-1, baseVisualShapeIndex=canopy_visual,
+            basePosition=[ox, oy, 0.7],
+        )
+    else:  # stone
+        stone_visual = p.createVisualShape(
+            shapeType=p.GEOM_SPHERE, radius=0.22, rgbaColor=[0.5, 0.5, 0.5, 1.0]
+        )
+        p.createMultiBody(
+            baseMass=0, baseCollisionShapeIndex=-1, baseVisualShapeIndex=stone_visual,
+            basePosition=[ox, oy, 0.18],
+        )
+
+# ============================================================
+# REAL DETECTION: OpenCV ORB feature matching against reference photos
 # ============================================================
 
 orb = cv2.ORB_create(nfeatures=800)
@@ -131,67 +224,34 @@ for filename in image_files:
         reference_descriptors.append((filename, des))
 
 print(f"Loaded {len(reference_descriptors)} reference landmine images for detection.")
+print(f"Swarm of {len(robots)} robots deployed. Minefield contains {len(MINE_LAYOUT)} mines + 1 decoy.")
 
 MATCH_THRESHOLD = 8
-DETECTION_RANGE = 0.8  # meters — only attempt a match when this close to an unreported mine
-detection_text_id = None
-already_reported = set()
+already_reported = set()  # mine ids that have already been reported (shared across the whole swarm)
 
 
 def check_for_landmine(camera_frame_bgr, only_filename=None):
-    """ORB matching against reference photos. If only_filename is given,
-    only that specific reference is compared — prevents a nearby match from
-    getting misattributed to a different, un-encountered mine."""
     gray = cv2.cvtColor(camera_frame_bgr, cv2.COLOR_BGR2GRAY)
     kp, des = orb.detectAndCompute(gray, None)
     if des is None:
-        return False, 0, None
+        return False, 0
 
     candidates = reference_descriptors
     if only_filename is not None:
         candidates = [(name, d) for name, d in reference_descriptors if name == only_filename]
 
     best_count = 0
-    best_name = None
     for filename, ref_des in candidates:
         matches = bf.match(des, ref_des)
         good_matches = [m for m in matches if m.distance < 70]
         if len(good_matches) > best_count:
             best_count = len(good_matches)
-            best_name = filename
 
-    return best_count >= MATCH_THRESHOLD, best_count, best_name
-
-
-def get_robot_camera_image():
-    base_pos, base_orn = p.getBasePositionAndOrientation(robot)
-    cam_eye = [base_pos[0], base_pos[1], base_pos[2] + 0.3]
-    cam_target = [base_pos[0] + 1.0, base_pos[1], base_pos[2]]
-
-    view_matrix = p.computeViewMatrix(cam_eye, cam_target, [0, 0, 1])
-    proj_matrix = p.computeProjectionMatrixFOV(fov=70, aspect=1.0, nearVal=0.05, farVal=5.0)
-
-    # TinyRenderer (software, CPU-based) instead of hardware OpenGL — the
-    # hardware renderer competes with PyBullet's own GUI window for the
-    # graphics context and was causing stalls/freezing when called
-    # repeatedly. Software rendering at this small resolution is plenty
-    # fast and doesn't fight the GUI for GPU resources.
-    width, height, rgb_img, _, _ = p.getCameraImage(
-        width=128, height=96, viewMatrix=view_matrix, projectionMatrix=proj_matrix,
-        renderer=p.ER_TINY_RENDERER,
-    )
-    rgb_array = np.reshape(rgb_img, (height, width, 4))[:, :, :3].astype(np.uint8)
-    bgr_array = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
-    return bgr_array
+    return best_count >= MATCH_THRESHOLD, best_count
 
 
-def get_detection_camera_image():
-    """Higher-resolution capture used ONLY for the ORB matching step (not
-    for the live display feed). The small 128x96 display frame doesn't have
-    enough pixel detail for reliable feature matching — this only runs when
-    we're already close to an unreported mine, so the extra render cost is
-    negligible (it's a rare, brief burst, not a continuous cost)."""
-    base_pos, base_orn = p.getBasePositionAndOrientation(robot)
+def get_camera_image(body_id, width, height, renderer):
+    base_pos, base_orn = p.getBasePositionAndOrientation(body_id)
     cam_eye = [base_pos[0], base_pos[1], base_pos[2] + 0.3]
     cam_target = [base_pos[0] + 1.0, base_pos[1], base_pos[2]]
 
@@ -199,148 +259,235 @@ def get_detection_camera_image():
     proj_matrix = p.computeProjectionMatrixFOV(fov=70, aspect=1.0, nearVal=0.05, farVal=5.0)
 
     width, height, rgb_img, _, _ = p.getCameraImage(
-        width=320, height=240, viewMatrix=view_matrix, projectionMatrix=proj_matrix,
-        renderer=p.ER_TINY_RENDERER,
+        width=width, height=height, viewMatrix=view_matrix, projectionMatrix=proj_matrix, renderer=renderer
     )
     rgb_array = np.reshape(rgb_img, (height, width, 4))[:, :, :3].astype(np.uint8)
-    bgr_array = cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
-    return bgr_array
+    return cv2.cvtColor(rgb_array, cv2.COLOR_RGB2BGR)
 
 
 # ============================================================
-# LIVE CAMERA FEED WINDOW (top-right of the screen)
+# LIVE CAMERA WINDOWS — one per robot, arranged across the top
 # ============================================================
 
-CAMERA_WINDOW_NAME = "Robot Camera Feed"
-CAMERA_DISPLAY_SCALE = 4  # upscale so the small render is actually visible
-cv2.namedWindow(CAMERA_WINDOW_NAME, cv2.WINDOW_NORMAL)
-cv2.resizeWindow(CAMERA_WINDOW_NAME, 128 * CAMERA_DISPLAY_SCALE, 96 * CAMERA_DISPLAY_SCALE)
-cv2.moveWindow(CAMERA_WINDOW_NAME, 900, 20)  # adjust if your screen resolution differs
+DISPLAY_SCALE = 4
+window_positions = {"left": 20, "center": 460, "right": 900}
+for name in robots:
+    window_name = f"Camera Feed - {name.upper()}"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 128 * DISPLAY_SCALE, 96 * DISPLAY_SCALE)
+    cv2.moveWindow(window_name, window_positions[name], 20)
+    robots[name]["window_name"] = window_name
+
+# --- Plain mission dashboard: just the numbers, no styling ---
+DASHBOARD_WINDOW = "Mission Dashboard"
+DASHBOARD_WIDTH = 480
+DASHBOARD_HEIGHT = 260
+cv2.namedWindow(DASHBOARD_WINDOW, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(DASHBOARD_WINDOW, DASHBOARD_WIDTH, DASHBOARD_HEIGHT)
+cv2.moveWindow(DASHBOARD_WINDOW, 20, 460)
+
+
+def draw_dashboard():
+    canvas = np.zeros((DASHBOARD_HEIGHT, DASHBOARD_WIDTH, 3), dtype=np.uint8)
+    lines = [
+        f"Robots deployed: {len(robots)}",
+        f"Mines detected: {len(already_reported)}",
+        f"Mission time: {time.time() - start_time:.1f}s",
+        f"Left  x: {robots['left'].get('last_x', 0):.2f}",
+        f"Center x: {robots['center'].get('last_x', 0):.2f}",
+        f"Right x: {robots['right'].get('last_x', 0):.2f}",
+    ]
+    for i, line in enumerate(lines):
+        cv2.putText(
+            canvas, line, (15, 40 + i * 38), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2
+        )
+    cv2.imshow(DASHBOARD_WINDOW, canvas)
+
+# ============================================================
+# FINAL MISSION MAP: plots detected landmines and obstacles once
+# every robot in the swarm has reached the destination
+# ============================================================
+
+def show_final_map():
+    fig, ax = plt.subplots(figsize=(9, 6))
+
+    landmine_xs = [mine_position_lookup[mid][0] for mid in already_reported]
+    landmine_ys = [mine_position_lookup[mid][1] for mid in already_reported]
+    ax.scatter(
+        landmine_xs, landmine_ys, marker="^", color="red", s=180,
+        label="Detected Landmine", zorder=5, edgecolors="black",
+    )
+
+    tree_xs = [o["position"][0] for o in OBSTACLES if o["type"] == "tree"]
+    tree_ys = [o["position"][1] for o in OBSTACLES if o["type"] == "tree"]
+    stone_xs = [o["position"][0] for o in OBSTACLES if o["type"] == "stone"]
+    stone_ys = [o["position"][1] for o in OBSTACLES if o["type"] == "stone"]
+    ax.scatter(tree_xs, tree_ys, marker="o", color="green", s=160, label="Tree", zorder=5, edgecolors="black")
+    ax.scatter(stone_xs, stone_ys, marker="s", color="gray", s=140, label="Stone", zorder=5, edgecolors="black")
+
+    # Reference lines showing each robot's patrol lane
+    for name, y in ROBOT_Y_OFFSETS.items():
+        ax.axhline(y=y, color="blue", linestyle="--", alpha=0.25)
+        ax.text(END_X + 0.2, y, name, color="blue", va="center", fontsize=9)
+
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.axvline(0, color="black", linewidth=0.8)
+    ax.set_xlabel("X coordinate (m)")
+    ax.set_ylabel("Y coordinate (m)")
+    ax.set_title("Mission Summary: Detected Landmines & Obstacles")
+    ax.legend(loc="upper left")
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(-1, END_X + 2.5)
+    ax.set_ylim(-4, 5)
+    plt.tight_layout()
+    plt.show()
+
 
 # ============================================================
 # MAIN LOOP
 # ============================================================
 
 start_time = time.time()
-reached_destination = False
-
-state = "MOVING"          # MOVING | STOPPED
-stop_end_time = 0.0
-boost_end_time = 0.0
-
-CAMERA_UPDATE_INTERVAL = 4  # ~60 updates/sec at 240Hz sim rate — smooth but not overloaded
 step_counter = 0
+CAMERA_UPDATE_INTERVAL = 4  # ~60 updates/sec at 240Hz sim rate
 
 while True:
     t = time.time() - start_time
     now = time.time()
 
-    for leg_side, joint_index in MOTORS.items():
-        if leg_side.endswith("R"):
-            leg_group = leg_side[:-1]
-            side_offset = 0.0
+    # Press 'N' at any time to toggle night mode and see the fluorescent
+    # markers' visibility advantage in low light
+    keys = p.getKeyboardEvents()
+    if ord("n") in keys and keys[ord("n")] & p.KEY_WAS_TRIGGERED:
+        NIGHT_MODE = not NIGHT_MODE
+        apply_night_mode(NIGHT_MODE)
+        print(f"Night mode {'ON' if NIGHT_MODE else 'OFF'}")
+
+    for name, robot in robots.items():
+        body_id = robot["body_id"]
+
+        # --- Gait: drive all 8 leg motors ---
+        for leg_side, joint_index in MOTORS.items():
+            if leg_side.endswith("R"):
+                leg_group = leg_side[:-1]
+                side_offset = 0.0
+            else:
+                leg_group = leg_side[:-1]
+                side_offset = RL_PHASE_OFFSET
+            phase = DIAGONAL_PHASE[leg_group]
+            angle = BASE_ANGLE + AMPLITUDE * math.sin(2 * math.pi * FREQUENCY * t + phase + side_offset)
+            p.setJointMotorControl2(
+                bodyUniqueId=body_id, jointIndex=joint_index, controlMode=p.POSITION_CONTROL,
+                targetPosition=angle, force=35,
+            )
+
+        base_pos, _ = p.getBasePositionAndOrientation(body_id)
+        robot["last_x"] = base_pos[0]
+        robot["last_y"] = base_pos[1]
+
+        if not robot["reached_destination"] and base_pos[0] >= END_X:
+            robot["reached_destination"] = True
+            print(f"[{name.upper()}] Reached destination at ({base_pos[0]:.2f}, {base_pos[1]:.2f})")
+
+        if robot["state"] == "STOPPED" and now >= robot["stop_end_time"]:
+            robot["state"] = "MOVING"
+            robot["boost_end_time"] = now + BOOST_DURATION
+
+        if robot["reached_destination"] or robot["state"] == "STOPPED":
+            current_speed = 0.0
+        elif now < robot["boost_end_time"]:
+            current_speed = BOOST_SPEED
         else:
-            leg_group = leg_side[:-1]
-            side_offset = RL_PHASE_OFFSET
+            current_speed = NORMAL_SPEED
 
-        phase = DIAGONAL_PHASE[leg_group]
-        angle = BASE_ANGLE + AMPLITUDE * math.sin(2 * math.pi * FREQUENCY * t + phase + side_offset)
+        current_vel, current_ang_vel = p.getBaseVelocity(body_id)
 
-        p.setJointMotorControl2(
-            bodyUniqueId=robot,
-            jointIndex=joint_index,
-            controlMode=p.POSITION_CONTROL,
-            targetPosition=angle,
-            force=35,
+        # --- Obstacle avoidance: steer sideways around anything in this
+        # robot's own lane, then settle back onto the original path ---
+        home_lane_y = robot["y_offset"]
+        target_y = home_lane_y
+        for obs in OBSTACLES:
+            ox, oy, oz = obs["position"]
+            if abs(oy - home_lane_y) > OBSTACLE_LANE_THRESHOLD:
+                continue  # this obstacle isn't in this robot's lane at all
+            if (ox - AVOID_LOOKAHEAD) <= base_pos[0] <= (ox + AVOID_CLEAR_MARGIN):
+                # Steer to whichever side of the obstacle is away from lane center
+                steer_sign = -1.0 if oy >= home_lane_y else 1.0
+                target_y = home_lane_y + steer_sign * AVOID_OFFSET
+                break  # only handle one obstacle at a time
+
+        lateral_error = target_y - base_pos[1]
+        vy = max(-MAX_LATERAL_SPEED, min(MAX_LATERAL_SPEED, LATERAL_KP * lateral_error))
+
+        p.resetBaseVelocity(
+            body_id, linearVelocity=[current_speed, vy, current_vel[2]], angularVelocity=current_ang_vel
         )
 
-    base_pos, _ = p.getBasePositionAndOrientation(robot)
+        # --- Camera + detection (throttled) ---
+        if step_counter % CAMERA_UPDATE_INTERVAL == 0:
+            frame = get_camera_image(body_id, 128, 96, p.ER_TINY_RENDERER)
+            display_frame = cv2.resize(
+                frame, (128 * DISPLAY_SCALE, 96 * DISPLAY_SCALE), interpolation=cv2.INTER_NEAREST
+            )
+            cv2.imshow(robot["window_name"], display_frame)
 
-    if not reached_destination and base_pos[0] >= END_POINT[0]:
-        reached_destination = True
-        print(f"Reached destination point B at ({base_pos[0]:.2f}, {base_pos[1]:.2f})")
+            if not robot["reached_destination"] and robot["state"] == "MOVING":
+                nearby_mine = None
+                for mine in MINE_LAYOUT:
+                    if mine["id"] in already_reported:
+                        continue
+                    mx, my, mz = mine["position"]
+                    if abs(base_pos[0] - mx) < DETECTION_RANGE and abs(base_pos[1] - my) < DETECTION_RANGE:
+                        nearby_mine = mine
+                        break
 
-    if state == "STOPPED" and now >= stop_end_time:
-        state = "MOVING"
-        boost_end_time = now + BOOST_DURATION
+                if nearby_mine is not None:
+                    detection_frame = get_camera_image(body_id, 320, 240, p.ER_TINY_RENDERER)
+                    found, match_count = check_for_landmine(detection_frame, only_filename=nearby_mine["image"])
 
-    if reached_destination or state == "STOPPED":
-        current_speed = 0.0
-    elif now < boost_end_time:
-        current_speed = BOOST_SPEED
-    else:
-        current_speed = NORMAL_SPEED
+                    if found:
+                        already_reported.add(nearby_mine["id"])
+                        mine_pos = mine_position_lookup[nearby_mine["id"]]
 
-    current_vel, current_ang_vel = p.getBaseVelocity(robot)
-    p.resetBaseVelocity(
-        robot,
-        linearVelocity=[current_speed, 0, current_vel[2]],
-        angularVelocity=current_ang_vel,
-    )
+                        print(
+                            f"[{name.upper()}] LANDMINE DETECTED — {nearby_mine['id']} "
+                            f"({match_count} keypoint matches) at coordinates "
+                            f"x={mine_pos[0]:.2f}, y={mine_pos[1]:.2f}"
+                        )
 
-    step_counter += 1
+                        if HAS_WINSOUND:
+                            winsound.Beep(1000, 200)  # 1kHz beep, 200ms — audible detection cue
+
+                        p.addUserDebugText(
+                            f"({mine_pos[0]:.2f}, {mine_pos[1]:.2f})",
+                            [mine_pos[0], mine_pos[1], mine_pos[2] + 0.5],
+                            textColorRGB=[1, 0, 0],
+                            textSize=0.75,
+                        )
+
+                        # Fluorescent ground marker
+                        marker_visual = p.createVisualShape(
+                            shapeType=p.GEOM_CYLINDER, radius=0.35, length=0.01,
+                            rgbaColor=[1.0, 1.0, 0.0, 1.0],
+                        )
+                        p.createMultiBody(
+                            baseMass=0, baseCollisionShapeIndex=-1, baseVisualShapeIndex=marker_visual,
+                            basePosition=[mine_pos[0], mine_pos[1], 0.005],
+                        )
+
+                        robot["state"] = "STOPPED"
+                        robot["stop_end_time"] = now + STOP_DURATION
+
     if step_counter % CAMERA_UPDATE_INTERVAL == 0:
-        # Capture and display the live camera feed continuously, regardless
-        # of whether a mine is nearby — this is the always-on camera window.
-        frame = get_robot_camera_image()
-        display_frame = cv2.resize(
-            frame, (128 * CAMERA_DISPLAY_SCALE, 96 * CAMERA_DISPLAY_SCALE), interpolation=cv2.INTER_NEAREST
-        )
-        cv2.imshow(CAMERA_WINDOW_NAME, display_frame)
-        cv2.waitKey(1)
+        draw_dashboard()
 
-        # Reuse this same frame for detection matching so we don't render twice
-        if not reached_destination and state == "MOVING":
-            nearby_mine = None
-            for mine in MINE_LAYOUT:
-                if mine["image"] in already_reported:
-                    continue
-                mx, my, mz = mine["position"]
-                if abs(base_pos[0] - mx) < DETECTION_RANGE and abs(base_pos[1] - my) < DETECTION_RANGE:
-                    nearby_mine = mine
-                    break
-
-            if nearby_mine is not None:
-                detection_frame = get_detection_camera_image()
-                found, match_count, match_name = check_for_landmine(detection_frame, only_filename=nearby_mine["image"])
-
-                if found and match_name not in already_reported:
-                    already_reported.add(match_name)
-                    mine_pos = mine_filename_to_position.get(match_name, base_pos)
-
-                    print(
-                        f"LANDMINE DETECTED — matched '{match_name}' "
-                        f"({match_count} keypoint matches) at coordinates "
-                        f"x={mine_pos[0]:.2f}, y={mine_pos[1]:.2f}"
-                    )
-
-                    if detection_text_id is not None:
-                        p.removeUserDebugItem(detection_text_id)
-                    detection_text_id = p.addUserDebugText(
-                        f"LANDMINE at ({mine_pos[0]:.2f}, {mine_pos[1]:.2f})",
-                        [mine_pos[0], mine_pos[1], mine_pos[2] + 0.5],
-                        textColorRGB=[1, 0, 0],
-                        textSize=1.5,
-                    )
-
-                    # Mark the ground with a bright fluorescent-yellow patch
-                    # so the spot stays visible even in low-light/night
-                    # conditions — a flat disc laid directly on the ground.
-                    marker_visual = p.createVisualShape(
-                        shapeType=p.GEOM_CYLINDER,
-                        radius=0.35,
-                        length=0.01,
-                        rgbaColor=[1.0, 1.0, 0.0, 1.0],  # bright fluorescent yellow
-                    )
-                    p.createMultiBody(
-                        baseMass=0,
-                        baseCollisionShapeIndex=-1,  # visual only, doesn't affect movement
-                        baseVisualShapeIndex=marker_visual,
-                        basePosition=[mine_pos[0], mine_pos[1], 0.005],
-                    )
-
-                    state = "STOPPED"
-                    stop_end_time = now + STOP_DURATION
-
+    cv2.waitKey(1)
+    step_counter += 1
     p.stepSimulation()
     time.sleep(1 / 240)
+
+    if all(r["reached_destination"] for r in robots.values()):
+        print("All robots have reached the destination. Generating mission summary map...")
+        cv2.destroyAllWindows()
+        show_final_map()
+        break
